@@ -7,6 +7,7 @@ from typing import (
     Callable,
     TypeVar,
     Awaitable,
+    Union,
 )
 import os
 import httpx
@@ -21,6 +22,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from mcp.server.fastmcp import FastMCP, Context
 from dotenv import load_dotenv
+import json
 
 """
 Superset MCP Integration
@@ -325,7 +327,11 @@ async def superset_auth_check_token_validity(ctx: Context) -> Dict[str, Any]:
     """
     Check if the current access token is still valid
 
-    Returns status of token validity check
+    Makes a request to the /api/v1/me/ endpoint to test if the current token is valid.
+    Use this to verify authentication status before making other API calls.
+
+    Returns:
+        A dictionary with token validity status and any error information
     """
     superset_ctx: SupersetContext = ctx.request_context.lifespan_context
 
@@ -354,7 +360,11 @@ async def superset_auth_refresh_token(ctx: Context) -> Dict[str, Any]:
     """
     Refresh the access token using the refresh endpoint
 
-    Returns the new access token if successful
+    Makes a request to the /api/v1/security/refresh endpoint to get a new access token
+    without requiring re-authentication with username/password.
+
+    Returns:
+        A dictionary with the new access token or error information
     """
     superset_ctx: SupersetContext = ctx.request_context.lifespan_context
 
@@ -400,13 +410,17 @@ async def superset_auth_authenticate_user(
     """
     Authenticate with Superset and get access token
 
+    Makes a request to the /api/v1/security/login endpoint to authenticate and obtain an access token.
     If there's an existing token, will first try to check its validity.
     If invalid, will attempt to refresh token before falling back to re-authentication.
 
     Args:
-        username: Superset username (or use env var)
-        password: Superset password (or use env var)
+        username: Superset username (falls back to environment variable if not provided)
+        password: Superset password (falls back to environment variable if not provided)
         refresh: Whether to refresh the token if invalid (defaults to True)
+
+    Returns:
+        A dictionary with authentication status and access token or error information
     """
     superset_ctx: SupersetContext = ctx.request_context.lifespan_context
 
@@ -483,7 +497,15 @@ async def superset_auth_authenticate_user(
 @requires_auth
 @handle_api_errors
 async def superset_dashboard_list(ctx: Context) -> Dict[str, Any]:
-    """Get a list of dashboards from Superset"""
+    """
+    Get a list of dashboards from Superset
+
+    Makes a request to the /api/v1/dashboard/ endpoint to retrieve all dashboards
+    the current user has access to view. Results are paginated.
+
+    Returns:
+        A dictionary containing dashboard data including id, title, url, and metadata
+    """
     return await make_api_request(ctx, "get", "/api/v1/dashboard/")
 
 
@@ -496,8 +518,14 @@ async def superset_dashboard_get_by_id(
     """
     Get details for a specific dashboard
 
+    Makes a request to the /api/v1/dashboard/{id} endpoint to retrieve detailed
+    information about a specific dashboard.
+
     Args:
         dashboard_id: ID of the dashboard to retrieve
+
+    Returns:
+        A dictionary with complete dashboard information including components and layout
     """
     return await make_api_request(ctx, "get", f"/api/v1/dashboard/{dashboard_id}")
 
@@ -511,9 +539,15 @@ async def superset_dashboard_create(
     """
     Create a new dashboard in Superset
 
+    Makes a request to the /api/v1/dashboard/ POST endpoint to create a new dashboard.
+
     Args:
         dashboard_title: Title of the dashboard
-        json_metadata: Optional JSON metadata for dashboard configuration
+        json_metadata: Optional JSON metadata for dashboard configuration,
+                       can include layout, color scheme, and filter configuration
+
+    Returns:
+        A dictionary with the created dashboard information including its ID
     """
     payload = {"dashboard_title": dashboard_title}
     if json_metadata:
@@ -531,9 +565,15 @@ async def superset_dashboard_update(
     """
     Update an existing dashboard
 
+    Makes a request to the /api/v1/dashboard/{id} PUT endpoint to update
+    dashboard properties.
+
     Args:
         dashboard_id: ID of the dashboard to update
-        data: Data to update (dictionary with fields to update)
+        data: Data to update, can include dashboard_title, slug, owners, position, and metadata
+
+    Returns:
+        A dictionary with the updated dashboard information
     """
     return await make_api_request(
         ctx, "put", f"/api/v1/dashboard/{dashboard_id}", data=data
@@ -547,8 +587,14 @@ async def superset_dashboard_delete(ctx: Context, dashboard_id: int) -> Dict[str
     """
     Delete a dashboard
 
+    Makes a request to the /api/v1/dashboard/{id} DELETE endpoint to remove a dashboard.
+    This operation is permanent and cannot be undone.
+
     Args:
         dashboard_id: ID of the dashboard to delete
+
+    Returns:
+        A dictionary with deletion confirmation message
     """
     response = await make_api_request(
         ctx, "delete", f"/api/v1/dashboard/{dashboard_id}"
@@ -568,7 +614,15 @@ async def superset_dashboard_delete(ctx: Context, dashboard_id: int) -> Dict[str
 @requires_auth
 @handle_api_errors
 async def superset_chart_list(ctx: Context) -> Dict[str, Any]:
-    """Get a list of charts from Superset"""
+    """
+    Get a list of charts from Superset
+
+    Makes a request to the /api/v1/chart/ endpoint to retrieve all charts
+    the current user has access to view. Results are paginated.
+
+    Returns:
+        A dictionary containing chart data including id, slice_name, viz_type, and datasource info
+    """
     return await make_api_request(ctx, "get", "/api/v1/chart/")
 
 
@@ -579,8 +633,14 @@ async def superset_chart_get_by_id(ctx: Context, chart_id: int) -> Dict[str, Any
     """
     Get details for a specific chart
 
+    Makes a request to the /api/v1/chart/{id} endpoint to retrieve detailed
+    information about a specific chart/slice.
+
     Args:
         chart_id: ID of the chart to retrieve
+
+    Returns:
+        A dictionary with complete chart information including visualization configuration
     """
     return await make_api_request(ctx, "get", f"/api/v1/chart/{chart_id}")
 
@@ -599,12 +659,17 @@ async def superset_chart_create(
     """
     Create a new chart in Superset
 
+    Makes a request to the /api/v1/chart/ POST endpoint to create a new visualization.
+
     Args:
-        slice_name: Name of the chart
-        datasource_id: ID of the dataset
-        datasource_type: Type of datasource (table or query)
-        viz_type: Visualization type (e.g., bar, line, etc.)
-        params: Visualization parameters
+        slice_name: Name/title of the chart
+        datasource_id: ID of the dataset or SQL table
+        datasource_type: Type of datasource ('table' for datasets, 'query' for SQL)
+        viz_type: Visualization type (e.g., 'bar', 'line', 'pie', 'big_number', etc.)
+        params: Visualization parameters including metrics, groupby, time_range, etc.
+
+    Returns:
+        A dictionary with the created chart information including its ID
     """
     payload = {
         "slice_name": slice_name,
@@ -626,9 +691,15 @@ async def superset_chart_update(
     """
     Update an existing chart
 
+    Makes a request to the /api/v1/chart/{id} PUT endpoint to update
+    chart properties and visualization settings.
+
     Args:
         chart_id: ID of the chart to update
-        data: Data to update (dictionary with fields to update)
+        data: Data to update, can include slice_name, description, viz_type, params, etc.
+
+    Returns:
+        A dictionary with the updated chart information
     """
     return await make_api_request(ctx, "put", f"/api/v1/chart/{chart_id}", data=data)
 
@@ -640,8 +711,14 @@ async def superset_chart_delete(ctx: Context, chart_id: int) -> Dict[str, Any]:
     """
     Delete a chart
 
+    Makes a request to the /api/v1/chart/{id} DELETE endpoint to remove a chart.
+    This operation is permanent and cannot be undone.
+
     Args:
         chart_id: ID of the chart to delete
+
+    Returns:
+        A dictionary with deletion confirmation message
     """
     response = await make_api_request(ctx, "delete", f"/api/v1/chart/{chart_id}")
 
@@ -658,7 +735,15 @@ async def superset_chart_delete(ctx: Context, chart_id: int) -> Dict[str, Any]:
 @requires_auth
 @handle_api_errors
 async def superset_database_list(ctx: Context) -> Dict[str, Any]:
-    """Get a list of databases from Superset"""
+    """
+    Get a list of databases from Superset
+
+    Makes a request to the /api/v1/database/ endpoint to retrieve all database
+    connections the current user has access to. Results are paginated.
+
+    Returns:
+        A dictionary containing database connection information including id, name, and configuration
+    """
     return await make_api_request(ctx, "get", "/api/v1/database/")
 
 
@@ -669,8 +754,14 @@ async def superset_database_get_by_id(ctx: Context, database_id: int) -> Dict[st
     """
     Get details for a specific database
 
+    Makes a request to the /api/v1/database/{id} endpoint to retrieve detailed
+    information about a specific database connection.
+
     Args:
         database_id: ID of the database to retrieve
+
+    Returns:
+        A dictionary with complete database configuration information
     """
     return await make_api_request(ctx, "get", f"/api/v1/database/{database_id}")
 
@@ -679,23 +770,53 @@ async def superset_database_get_by_id(ctx: Context, database_id: int) -> Dict[st
 @requires_auth
 @handle_api_errors
 async def superset_database_create(
-    ctx: Context, database_name: str, sqlalchemy_uri: str, extra: Dict[str, Any] = None
+    ctx: Context,
+    engine: str,
+    configuration_method: str,
+    database_name: str,
+    sqlalchemy_uri: str,
 ) -> Dict[str, Any]:
     """
     Create a new database connection in Superset
 
+    IMPORTANT: Don't call this tool, unless user have given connection details. This function will only create database connections with explicit user consent and input.
+    No default values or assumptions will be made without user confirmation. All connection parameters,
+    including sensitive credentials, must be explicitly provided by the user.
+
+    Makes a POST request to /api/v1/database/ to create a new database connection in Superset.
+    The endpoint requires a valid SQLAlchemy URI and database configuration parameters.
+    The engine parameter will be automatically determined from the SQLAlchemy URI prefix if not specified:
+    - 'postgresql://' -> engine='postgresql'
+    - 'mysql://' -> engine='mysql'
+    - 'mssql://' -> engine='mssql'
+    - 'oracle://' -> engine='oracle'
+    - 'sqlite://' -> engine='sqlite'
+
+    The SQLAlchemy URI must follow the format: dialect+driver://username:password@host:port/database
+    If the URI is not provided, the function will prompt for individual connection parameters to construct it.
+
+    All required parameters must be provided and validated before creating the connection.
+    The configuration_method parameter should typically be set to 'sqlalchemy_form'.
+
     Args:
+        engine: Database engine (e.g., 'postgresql', 'mysql', etc.)
+        configuration_method: Method used for configuration (typically 'sqlalchemy_form')
         database_name: Name for the database connection
-        sqlalchemy_uri: SQLAlchemy URI for the connection
-        extra: Optional extra configuration parameters
+        sqlalchemy_uri: SQLAlchemy URI for the connection (e.g., 'postgresql://user:pass@host/db')
+
+    Returns:
+        A dictionary with the created database connection information including its ID
     """
     payload = {
+        "engine": engine,
+        "configuration_method": configuration_method,
         "database_name": database_name,
         "sqlalchemy_uri": sqlalchemy_uri,
+        "allow_dml": True,
+        "allow_cvas": True,
+        "allow_ctas": True,
+        "expose_in_sqllab": True,
     }
-
-    if extra:
-        payload["extra"] = extra
 
     return await make_api_request(ctx, "post", "/api/v1/database/", data=payload)
 
@@ -709,8 +830,14 @@ async def superset_database_get_tables(
     """
     Get a list of tables for a given database
 
+    Makes a request to the /api/v1/database/{id}/tables/ endpoint to retrieve
+    all tables available in the database.
+
     Args:
         database_id: ID of the database
+
+    Returns:
+        A dictionary with list of tables including schema and table name information
     """
     return await make_api_request(ctx, "get", f"/api/v1/database/{database_id}/tables/")
 
@@ -722,8 +849,14 @@ async def superset_database_schemas(ctx: Context, database_id: int) -> Dict[str,
     """
     Get schemas for a specific database
 
+    Makes a request to the /api/v1/database/{id}/schemas/ endpoint to retrieve
+    all schemas available in the database.
+
     Args:
         database_id: ID of the database
+
+    Returns:
+        A dictionary with list of schema names
     """
     return await make_api_request(
         ctx, "get", f"/api/v1/database/{database_id}/schemas/"
@@ -739,8 +872,14 @@ async def superset_database_test_connection(
     """
     Test a database connection
 
+    Makes a request to the /api/v1/database/test_connection endpoint to verify if
+    the provided connection details can successfully connect to the database.
+
     Args:
-        database_data: Database connection data
+        database_data: Database connection details including sqlalchemy_uri and other parameters
+
+    Returns:
+        A dictionary with connection test results
     """
     return await make_api_request(
         ctx, "post", "/api/v1/database/test_connection", data=database_data
@@ -754,11 +893,17 @@ async def superset_database_update(
     ctx: Context, database_id: int, data: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Update an existing database
+    Update an existing database connection
+
+    Makes a request to the /api/v1/database/{id} PUT endpoint to update
+    database connection properties.
 
     Args:
         database_id: ID of the database to update
-        data: Data to update (dictionary with fields to update)
+        data: Data to update, can include database_name, sqlalchemy_uri, password, and extra configs
+
+    Returns:
+        A dictionary with the updated database information
     """
     return await make_api_request(
         ctx, "put", f"/api/v1/database/{database_id}", data=data
@@ -770,10 +915,16 @@ async def superset_database_update(
 @handle_api_errors
 async def superset_database_delete(ctx: Context, database_id: int) -> Dict[str, Any]:
     """
-    Delete a database
+    Delete a database connection
+
+    Makes a request to the /api/v1/database/{id} DELETE endpoint to remove a database connection.
+    This operation is permanent and cannot be undone. This will also remove associated datasets.
 
     Args:
         database_id: ID of the database to delete
+
+    Returns:
+        A dictionary with deletion confirmation message
     """
     response = await make_api_request(ctx, "delete", f"/api/v1/database/{database_id}")
 
@@ -792,8 +943,14 @@ async def superset_database_get_catalogs(
     """
     Get all catalogs from a database
 
+    Makes a request to the /api/v1/database/{id}/catalogs/ endpoint to retrieve
+    all catalogs available in the database.
+
     Args:
         database_id: ID of the database
+
+    Returns:
+        A dictionary with list of catalog names for databases that support catalogs
     """
     return await make_api_request(
         ctx, "get", f"/api/v1/database/{database_id}/catalogs/"
@@ -807,10 +964,16 @@ async def superset_database_get_connection(
     ctx: Context, database_id: int
 ) -> Dict[str, Any]:
     """
-    Get a database connection info
+    Get database connection information
+
+    Makes a request to the /api/v1/database/{id}/connection endpoint to retrieve
+    connection details for a specific database.
 
     Args:
         database_id: ID of the database
+
+    Returns:
+        A dictionary with detailed connection information
     """
     return await make_api_request(
         ctx, "get", f"/api/v1/database/{database_id}/connection"
@@ -826,8 +989,14 @@ async def superset_database_get_function_names(
     """
     Get function names supported by a database
 
+    Makes a request to the /api/v1/database/{id}/function_names/ endpoint to retrieve
+    all SQL functions supported by the database.
+
     Args:
         database_id: ID of the database
+
+    Returns:
+        A dictionary with list of supported function names
     """
     return await make_api_request(
         ctx, "get", f"/api/v1/database/{database_id}/function_names/"
@@ -841,10 +1010,16 @@ async def superset_database_get_related_objects(
     ctx: Context, database_id: int
 ) -> Dict[str, Any]:
     """
-    Get charts and dashboards count associated to a database
+    Get charts and dashboards associated with a database
+
+    Makes a request to the /api/v1/database/{id}/related_objects/ endpoint to retrieve
+    counts and references of charts and dashboards that depend on this database.
 
     Args:
         database_id: ID of the database
+
+    Returns:
+        A dictionary with counts and lists of related charts and dashboards
     """
     return await make_api_request(
         ctx, "get", f"/api/v1/database/{database_id}/related_objects/"
@@ -858,11 +1033,17 @@ async def superset_database_validate_sql(
     ctx: Context, database_id: int, sql: str
 ) -> Dict[str, Any]:
     """
-    Validate arbitrary SQL
+    Validate arbitrary SQL against a database
+
+    Makes a request to the /api/v1/database/{id}/validate_sql/ endpoint to check
+    if the provided SQL is valid for the specified database.
 
     Args:
         database_id: ID of the database
-        sql: SQL to validate
+        sql: SQL query to validate
+
+    Returns:
+        A dictionary with validation results
     """
     payload = {"sql": sql}
     return await make_api_request(
@@ -879,8 +1060,14 @@ async def superset_database_validate_parameters(
     """
     Validate database connection parameters
 
+    Makes a request to the /api/v1/database/validate_parameters/ endpoint to verify
+    if the provided connection parameters are valid without creating a connection.
+
     Args:
         parameters: Connection parameters to validate
+
+    Returns:
+        A dictionary with validation results
     """
     return await make_api_request(
         ctx, "post", "/api/v1/database/validate_parameters/", data=parameters
@@ -894,7 +1081,15 @@ async def superset_database_validate_parameters(
 @requires_auth
 @handle_api_errors
 async def superset_dataset_list(ctx: Context) -> Dict[str, Any]:
-    """Get a list of datasets from Superset"""
+    """
+    Get a list of datasets from Superset
+
+    Makes a request to the /api/v1/dataset/ endpoint to retrieve all datasets
+    the current user has access to view. Results are paginated.
+
+    Returns:
+        A dictionary containing dataset information including id, table_name, and database
+    """
     return await make_api_request(ctx, "get", "/api/v1/dataset/")
 
 
@@ -905,8 +1100,14 @@ async def superset_dataset_get_by_id(ctx: Context, dataset_id: int) -> Dict[str,
     """
     Get details for a specific dataset
 
+    Makes a request to the /api/v1/dataset/{id} endpoint to retrieve detailed
+    information about a specific dataset including columns and metrics.
+
     Args:
         dataset_id: ID of the dataset to retrieve
+
+    Returns:
+        A dictionary with complete dataset information
     """
     return await make_api_request(ctx, "get", f"/api/v1/dataset/{dataset_id}")
 
@@ -924,11 +1125,17 @@ async def superset_dataset_create(
     """
     Create a new dataset in Superset
 
+    Makes a request to the /api/v1/dataset/ POST endpoint to create a new dataset
+    from an existing database table or view.
+
     Args:
-        table_name: Name of the table
-        database_id: ID of the database
-        schema: Optional schema name
-        owners: Optional list of owner IDs
+        table_name: Name of the physical table in the database
+        database_id: ID of the database where the table exists
+        schema: Optional database schema name where the table is located
+        owners: Optional list of user IDs who should own this dataset
+
+    Returns:
+        A dictionary with the created dataset information including its ID
     """
     payload = {
         "table_name": table_name,
@@ -956,9 +1163,15 @@ async def superset_sqllab_execute_query(
     """
     Execute a SQL query in SQL Lab
 
+    Makes a request to the /api/v1/sqllab/execute/ endpoint to run a SQL query
+    against the specified database.
+
     Args:
         database_id: ID of the database to query
         sql: SQL query to execute
+
+    Returns:
+        A dictionary with query results or execution status for async queries
     """
     # Ensure we have a CSRF token before executing the query
     superset_ctx: SupersetContext = ctx.request_context.lifespan_context
@@ -981,7 +1194,15 @@ async def superset_sqllab_execute_query(
 @requires_auth
 @handle_api_errors
 async def superset_sqllab_get_saved_queries(ctx: Context) -> Dict[str, Any]:
-    """Get a list of saved queries from SQL Lab"""
+    """
+    Get a list of saved queries from SQL Lab
+
+    Makes a request to the /api/v1/saved_query/ endpoint to retrieve all saved queries
+    the current user has access to. Results are paginated.
+
+    Returns:
+        A dictionary containing saved query information including id, label, and database
+    """
     return await make_api_request(ctx, "get", "/api/v1/saved_query/")
 
 
@@ -990,10 +1211,16 @@ async def superset_sqllab_get_saved_queries(ctx: Context) -> Dict[str, Any]:
 @handle_api_errors
 async def superset_sqllab_format_sql(ctx: Context, sql: str) -> Dict[str, Any]:
     """
-    Format a SQL query
+    Format a SQL query for better readability
+
+    Makes a request to the /api/v1/sqllab/format_sql endpoint to apply standard
+    formatting rules to the provided SQL query.
 
     Args:
         sql: SQL query to format
+
+    Returns:
+        A dictionary with the formatted SQL
     """
     payload = {"sql": sql}
     return await make_api_request(
@@ -1006,10 +1233,16 @@ async def superset_sqllab_format_sql(ctx: Context, sql: str) -> Dict[str, Any]:
 @handle_api_errors
 async def superset_sqllab_get_results(ctx: Context, key: str) -> Dict[str, Any]:
     """
-    Get results of a SQL query
+    Get results of a previously executed SQL query
+
+    Makes a request to the /api/v1/sqllab/results/ endpoint to retrieve results
+    for an asynchronous query using its result key.
 
     Args:
         key: Result key to retrieve
+
+    Returns:
+        A dictionary with query results including column information and data rows
     """
     return await make_api_request(
         ctx, "get", f"/api/v1/sqllab/results/", params={"key": key}
@@ -1025,10 +1258,16 @@ async def superset_sqllab_estimate_query_cost(
     """
     Estimate the cost of executing a SQL query
 
+    Makes a request to the /api/v1/sqllab/estimate endpoint to get approximate cost
+    information for a query before executing it.
+
     Args:
         database_id: ID of the database
         sql: SQL query to estimate
         schema: Optional schema name
+
+    Returns:
+        A dictionary with estimated query cost metrics
     """
     payload = {
         "database_id": database_id,
@@ -1050,8 +1289,14 @@ async def superset_sqllab_export_query_results(
     """
     Export the results of a SQL query to CSV
 
+    Makes a request to the /api/v1/sqllab/export/{client_id} endpoint to download
+    query results in CSV format.
+
     Args:
         client_id: Client ID of the query
+
+    Returns:
+        A dictionary with the exported data or error information
     """
     superset_ctx: SupersetContext = ctx.request_context.lifespan_context
 
@@ -1073,7 +1318,15 @@ async def superset_sqllab_export_query_results(
 @requires_auth
 @handle_api_errors
 async def superset_sqllab_get_bootstrap_data(ctx: Context) -> Dict[str, Any]:
-    """Get the bootstrap data for SQL Lab"""
+    """
+    Get the bootstrap data for SQL Lab
+
+    Makes a request to the /api/v1/sqllab/ endpoint to retrieve configuration data
+    needed for the SQL Lab interface.
+
+    Returns:
+        A dictionary with SQL Lab configuration including allowed databases and settings
+    """
     return await make_api_request(ctx, "get", "/api/v1/sqllab/")
 
 
@@ -1087,8 +1340,14 @@ async def superset_saved_query_get_by_id(ctx: Context, query_id: int) -> Dict[st
     """
     Get details for a specific saved query
 
+    Makes a request to the /api/v1/saved_query/{id} endpoint to retrieve information
+    about a saved SQL query.
+
     Args:
         query_id: ID of the saved query to retrieve
+
+    Returns:
+        A dictionary with the saved query details including SQL text and database
     """
     return await make_api_request(ctx, "get", f"/api/v1/saved_query/{query_id}")
 
@@ -1102,8 +1361,19 @@ async def superset_saved_query_create(
     """
     Create a new saved query
 
+    Makes a request to the /api/v1/saved_query/ POST endpoint to save a SQL query
+    for later reuse.
+
     Args:
-        query_data: Saved query data including db_id, schema, sql, label, etc.
+        query_data: Dictionary containing the query information including:
+                   - db_id: Database ID
+                   - schema: Schema name (optional)
+                   - sql: SQL query text
+                   - label: Display name for the saved query
+                   - description: Optional description of the query
+
+    Returns:
+        A dictionary with the created saved query information including its ID
     """
     return await make_api_request(ctx, "post", "/api/v1/saved_query/", data=query_data)
 
@@ -1118,8 +1388,14 @@ async def superset_query_stop(ctx: Context, client_id: str) -> Dict[str, Any]:
     """
     Stop a running query
 
+    Makes a request to the /api/v1/query/stop endpoint to terminate a query that
+    is currently running.
+
     Args:
         client_id: Client ID of the query to stop
+
+    Returns:
+        A dictionary with confirmation of query termination
     """
     payload = {"client_id": client_id}
     return await make_api_request(ctx, "post", "/api/v1/query/stop", data=payload)
@@ -1129,7 +1405,15 @@ async def superset_query_stop(ctx: Context, client_id: str) -> Dict[str, Any]:
 @requires_auth
 @handle_api_errors
 async def superset_query_list(ctx: Context) -> Dict[str, Any]:
-    """Get a list of queries from Superset"""
+    """
+    Get a list of queries from Superset
+
+    Makes a request to the /api/v1/query/ endpoint to retrieve query history.
+    Results are paginated and include both finished and running queries.
+
+    Returns:
+        A dictionary containing query information including status, duration, and SQL
+    """
     return await make_api_request(ctx, "get", "/api/v1/query/")
 
 
@@ -1140,8 +1424,14 @@ async def superset_query_get_by_id(ctx: Context, query_id: int) -> Dict[str, Any
     """
     Get details for a specific query
 
+    Makes a request to the /api/v1/query/{id} endpoint to retrieve detailed
+    information about a specific query execution.
+
     Args:
         query_id: ID of the query to retrieve
+
+    Returns:
+        A dictionary with complete query execution information
     """
     return await make_api_request(ctx, "get", f"/api/v1/query/{query_id}")
 
@@ -1153,7 +1443,15 @@ async def superset_query_get_by_id(ctx: Context, query_id: int) -> Dict[str, Any
 @requires_auth
 @handle_api_errors
 async def superset_activity_get_recent(ctx: Context) -> Dict[str, Any]:
-    """Get recent activity data for the current user"""
+    """
+    Get recent activity data for the current user
+
+    Makes a request to the /api/v1/log/recent_activity/ endpoint to retrieve
+    a history of actions performed by the current user.
+
+    Returns:
+        A dictionary with recent user activities including viewed charts and dashboards
+    """
     return await make_api_request(ctx, "get", "/api/v1/log/recent_activity/")
 
 
@@ -1161,7 +1459,15 @@ async def superset_activity_get_recent(ctx: Context) -> Dict[str, Any]:
 @requires_auth
 @handle_api_errors
 async def superset_user_get_current(ctx: Context) -> Dict[str, Any]:
-    """Get information about the currently authenticated user"""
+    """
+    Get information about the currently authenticated user
+
+    Makes a request to the /api/v1/me/ endpoint to retrieve the user's profile
+    information including permissions and preferences.
+
+    Returns:
+        A dictionary with user profile data
+    """
     return await make_api_request(ctx, "get", "/api/v1/me/")
 
 
@@ -1169,7 +1475,15 @@ async def superset_user_get_current(ctx: Context) -> Dict[str, Any]:
 @requires_auth
 @handle_api_errors
 async def superset_user_get_roles(ctx: Context) -> Dict[str, Any]:
-    """Get roles for the current user"""
+    """
+    Get roles for the current user
+
+    Makes a request to the /api/v1/me/roles/ endpoint to retrieve all roles
+    assigned to the current user.
+
+    Returns:
+        A dictionary with user role information
+    """
     return await make_api_request(ctx, "get", "/api/v1/me/roles/")
 
 
@@ -1180,7 +1494,15 @@ async def superset_user_get_roles(ctx: Context) -> Dict[str, Any]:
 @requires_auth
 @handle_api_errors
 async def superset_tag_list(ctx: Context) -> Dict[str, Any]:
-    """Get a list of tags from Superset"""
+    """
+    Get a list of tags from Superset
+
+    Makes a request to the /api/v1/tag/ endpoint to retrieve all tags
+    defined in the Superset instance.
+
+    Returns:
+        A dictionary containing tag information including id and name
+    """
     return await make_api_request(ctx, "get", "/api/v1/tag/")
 
 
@@ -1191,8 +1513,14 @@ async def superset_tag_create(ctx: Context, name: str) -> Dict[str, Any]:
     """
     Create a new tag in Superset
 
+    Makes a request to the /api/v1/tag/ POST endpoint to create a new tag
+    that can be applied to objects like charts and dashboards.
+
     Args:
         name: Name for the tag
+
+    Returns:
+        A dictionary with the created tag information
     """
     payload = {"name": name}
     return await make_api_request(ctx, "post", "/api/v1/tag/", data=payload)
@@ -1205,8 +1533,14 @@ async def superset_tag_get_by_id(ctx: Context, tag_id: int) -> Dict[str, Any]:
     """
     Get details for a specific tag
 
+    Makes a request to the /api/v1/tag/{id} endpoint to retrieve information
+    about a specific tag.
+
     Args:
         tag_id: ID of the tag to retrieve
+
+    Returns:
+        A dictionary with tag details
     """
     return await make_api_request(ctx, "get", f"/api/v1/tag/{tag_id}")
 
@@ -1215,8 +1549,105 @@ async def superset_tag_get_by_id(ctx: Context, tag_id: int) -> Dict[str, Any]:
 @requires_auth
 @handle_api_errors
 async def superset_tag_objects(ctx: Context) -> Dict[str, Any]:
-    """Get objects associated with tags"""
+    """
+    Get objects associated with tags
+
+    Makes a request to the /api/v1/tag/get_objects/ endpoint to retrieve
+    all objects that have tags assigned to them.
+
+    Returns:
+        A dictionary with tagged objects grouped by tag
+    """
     return await make_api_request(ctx, "get", "/api/v1/tag/get_objects/")
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_tag_delete(ctx: Context, tag_id: int) -> Dict[str, Any]:
+    """
+    Delete a tag
+
+    Makes a request to the /api/v1/tag/{id} DELETE endpoint to remove a tag.
+    This operation is permanent and cannot be undone.
+
+    Args:
+        tag_id: ID of the tag to delete
+
+    Returns:
+        A dictionary with deletion confirmation message
+    """
+    response = await make_api_request(ctx, "delete", f"/api/v1/tag/{tag_id}")
+
+    if not response.get("error"):
+        return {"message": f"Tag {tag_id} deleted successfully"}
+
+    return response
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_tag_object_add(
+    ctx: Context, object_type: str, object_id: int, tag_name: str
+) -> Dict[str, Any]:
+    """
+    Add a tag to an object
+
+    Makes a request to tag an object with a specific tag. This creates an association
+    between the tag and the specified object (chart, dashboard, etc.)
+
+    Args:
+        object_type: Type of the object ('chart', 'dashboard', etc.)
+        object_id: ID of the object to tag
+        tag_name: Name of the tag to apply
+
+    Returns:
+        A dictionary with the tagging confirmation
+    """
+    payload = {
+        "object_type": object_type,
+        "object_id": object_id,
+        "tag_name": tag_name,
+    }
+
+    return await make_api_request(
+        ctx, "post", "/api/v1/tag/tagged_objects", data=payload
+    )
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_tag_object_remove(
+    ctx: Context, object_type: str, object_id: int, tag_name: str
+) -> Dict[str, Any]:
+    """
+    Remove a tag from an object
+
+    Makes a request to remove a tag association from a specific object.
+
+    Args:
+        object_type: Type of the object ('chart', 'dashboard', etc.)
+        object_id: ID of the object to untag
+        tag_name: Name of the tag to remove
+
+    Returns:
+        A dictionary with the untagging confirmation message
+    """
+    response = await make_api_request(
+        ctx,
+        "delete",
+        f"/api/v1/tag/{object_type}/{object_id}",
+        params={"tag_name": tag_name},
+    )
+
+    if not response.get("error"):
+        return {
+            "message": f"Tag '{tag_name}' removed from {object_type} {object_id} successfully"
+        }
+
+    return response
 
 
 # ===== Explore Tools =====
@@ -1231,8 +1662,14 @@ async def superset_explore_form_data_create(
     """
     Create form data for chart exploration
 
+    Makes a request to the /api/v1/explore/form_data POST endpoint to store
+    chart configuration data temporarily.
+
     Args:
-        form_data: Form data for chart configuration
+        form_data: Chart configuration including datasource, metrics, and visualization settings
+
+    Returns:
+        A dictionary with a key that can be used to retrieve the form data
     """
     return await make_api_request(
         ctx, "post", "/api/v1/explore/form_data", data=form_data
@@ -1246,8 +1683,14 @@ async def superset_explore_form_data_get(ctx: Context, key: str) -> Dict[str, An
     """
     Get form data for chart exploration
 
+    Makes a request to the /api/v1/explore/form_data/{key} endpoint to retrieve
+    previously stored chart configuration.
+
     Args:
         key: Key of the form data to retrieve
+
+    Returns:
+        A dictionary with the stored chart configuration
     """
     return await make_api_request(ctx, "get", f"/api/v1/explore/form_data/{key}")
 
@@ -1261,8 +1704,14 @@ async def superset_explore_permalink_create(
     """
     Create a permalink for chart exploration
 
+    Makes a request to the /api/v1/explore/permalink POST endpoint to generate
+    a shareable link to a specific chart exploration state.
+
     Args:
-        state: State data for the permalink
+        state: State data for the permalink including form_data
+
+    Returns:
+        A dictionary with a key that can be used to access the permalink
     """
     return await make_api_request(ctx, "post", "/api/v1/explore/permalink", data=state)
 
@@ -1274,8 +1723,14 @@ async def superset_explore_permalink_get(ctx: Context, key: str) -> Dict[str, An
     """
     Get a permalink for chart exploration
 
+    Makes a request to the /api/v1/explore/permalink/{key} endpoint to retrieve
+    a previously saved exploration state.
+
     Args:
         key: Key of the permalink to retrieve
+
+    Returns:
+        A dictionary with the stored exploration state
     """
     return await make_api_request(ctx, "get", f"/api/v1/explore/permalink/{key}")
 
@@ -1287,8 +1742,42 @@ async def superset_explore_permalink_get(ctx: Context, key: str) -> Dict[str, An
 @requires_auth
 @handle_api_errors
 async def superset_menu_get(ctx: Context) -> Dict[str, Any]:
-    """Get the Superset menu data"""
+    """
+    Get the Superset menu data
+
+    Makes a request to the /api/v1/menu/ endpoint to retrieve the navigation
+    menu structure based on user permissions.
+
+    Returns:
+        A dictionary with menu items and their configurations
+    """
     return await make_api_request(ctx, "get", "/api/v1/menu/")
+
+
+# ===== Configuration Tools =====
+
+
+@mcp.tool()
+@handle_api_errors
+async def superset_config_get_base_url(ctx: Context) -> Dict[str, Any]:
+    """
+    Get the base URL of the Superset instance
+
+    Returns the configured Superset base URL that this MCP server is connecting to.
+    This can be useful for constructing full URLs to Superset resources or for
+    displaying information about the connected instance.
+
+    This tool does not require authentication as it only returns configuration information.
+
+    Returns:
+        A dictionary with the Superset base URL
+    """
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+
+    return {
+        "base_url": superset_ctx.base_url,
+        "message": f"Connected to Superset instance at: {superset_ctx.base_url}",
+    }
 
 
 # ===== Advanced Data Type Tools =====
@@ -1303,9 +1792,15 @@ async def superset_advanced_data_type_convert(
     """
     Convert a value to an advanced data type
 
+    Makes a request to the /api/v1/advanced_data_type/convert endpoint to transform
+    a value into the specified advanced data type format.
+
     Args:
         type_name: Name of the advanced data type
         value: Value to convert
+
+    Returns:
+        A dictionary with the converted value
     """
     params = {
         "type_name": type_name,
@@ -1321,7 +1816,15 @@ async def superset_advanced_data_type_convert(
 @requires_auth
 @handle_api_errors
 async def superset_advanced_data_type_list(ctx: Context) -> Dict[str, Any]:
-    """Get list of available advanced data types"""
+    """
+    Get list of available advanced data types
+
+    Makes a request to the /api/v1/advanced_data_type/types endpoint to retrieve
+    all advanced data types supported by this Superset instance.
+
+    Returns:
+        A dictionary with available advanced data types and their configurations
+    """
     return await make_api_request(ctx, "get", "/api/v1/advanced_data_type/types")
 
 
