@@ -1,6 +1,6 @@
 # Superset MCP Integration
 
-This project provides a Model Control Protocol (MCP) server for interacting with Apache Superset, enabling AI agents to connect to and control a Superset instance programmatically.
+MCP server for interacting with Apache Superset, enabling AI agents to connect to and control a Superset instance programmatically.
 
 ## Setup Instructions
 

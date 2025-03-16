@@ -1,8 +1,19 @@
-from typing import Any, Dict, List, Optional, AsyncIterator
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    AsyncIterator,
+    Callable,
+    TypeVar,
+    Awaitable,
+)
 import os
 import httpx
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from functools import wraps
+import inspect
 from threading import Thread
 import webbrowser
 import uvicorn
@@ -122,8 +133,194 @@ mcp = FastMCP(
     dependencies=["fastapi", "uvicorn", "python-dotenv", "httpx"],
 )
 
+# Type variables for generic function annotations
+T = TypeVar("T")
+R = TypeVar("R")
+
+# ===== Helper Functions and Decorators =====
+
+
+def requires_auth(
+    func: Callable[..., Awaitable[Dict[str, Any]]],
+) -> Callable[..., Awaitable[Dict[str, Any]]]:
+    """Decorator to check authentication before executing a function"""
+
+    @wraps(func)
+    async def wrapper(ctx: Context, *args, **kwargs) -> Dict[str, Any]:
+        superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+
+        if not superset_ctx.access_token:
+            return {"error": "Not authenticated. Please authenticate first."}
+
+        return await func(ctx, *args, **kwargs)
+
+    return wrapper
+
+
+def handle_api_errors(
+    func: Callable[..., Awaitable[Dict[str, Any]]],
+) -> Callable[..., Awaitable[Dict[str, Any]]]:
+    """Decorator to handle API errors in a consistent way"""
+
+    @wraps(func)
+    async def wrapper(ctx: Context, *args, **kwargs) -> Dict[str, Any]:
+        try:
+            return await func(ctx, *args, **kwargs)
+        except Exception as e:
+            # Extract function name for better error context
+            function_name = func.__name__
+            return {"error": f"Error in {function_name}: {str(e)}"}
+
+    return wrapper
+
+
+async def with_auto_refresh(
+    ctx: Context, api_call: Callable[[], Awaitable[httpx.Response]]
+) -> httpx.Response:
+    """
+    Helper function to handle automatic token refreshing for API calls
+
+    This function will attempt to execute the provided API call. If the call
+    fails with a 401 Unauthorized error, it will try to refresh the token
+    and retry the API call once.
+
+    Args:
+        ctx: The MCP context
+        api_call: The API call function to execute (should be a callable that returns a response)
+    """
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+
+    if not superset_ctx.access_token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # First attempt
+    try:
+        response = await api_call()
+
+        # If not an auth error, return the response
+        if response.status_code != 401:
+            return response
+
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code != 401:
+            raise e
+        response = e.response
+    except Exception as e:
+        # For other errors, just raise
+        raise e
+
+    # If we got a 401, try to refresh the token
+    print("Received 401 Unauthorized. Attempting to refresh token...")
+    refresh_result = await superset_auth_refresh_token(ctx)
+
+    if refresh_result.get("error"):
+        # If refresh failed, try to re-authenticate
+        print(
+            f"Token refresh failed: {refresh_result.get('error')}. Attempting re-authentication..."
+        )
+        auth_result = await superset_auth_authenticate_user(ctx)
+
+        if auth_result.get("error"):
+            # If re-authentication failed, raise an exception
+            raise HTTPException(status_code=401, detail="Authentication failed")
+
+    # Retry the API call with the new token
+    return await api_call()
+
+
+async def get_csrf_token(ctx: Context) -> Optional[str]:
+    """
+    Get a CSRF token from Superset
+
+    Makes a request to the /api/v1/security/csrf_token endpoint to get a token
+
+    Args:
+        ctx: MCP context
+    """
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    client = superset_ctx.client
+
+    try:
+        response = await client.get("/api/v1/security/csrf_token/")
+        if response.status_code == 200:
+            data = response.json()
+            csrf_token = data.get("result")
+            superset_ctx.csrf_token = csrf_token
+            return csrf_token
+        else:
+            print(f"Failed to get CSRF token: {response.status_code} - {response.text}")
+            return None
+    except Exception as e:
+        print(f"Error getting CSRF token: {str(e)}")
+        return None
+
+
+async def make_api_request(
+    ctx: Context,
+    method: str,
+    endpoint: str,
+    data: Dict[str, Any] = None,
+    params: Dict[str, Any] = None,
+    auto_refresh: bool = True,
+) -> Dict[str, Any]:
+    """
+    Helper function to make API requests to Superset
+
+    Args:
+        ctx: MCP context
+        method: HTTP method (get, post, put, delete)
+        endpoint: API endpoint (without base URL)
+        data: Optional JSON payload for POST/PUT requests
+        params: Optional query parameters
+        auto_refresh: Whether to auto-refresh token on 401
+    """
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    client = superset_ctx.client
+
+    # For non-GET requests, make sure we have a CSRF token
+    if method.lower() != "get" and not superset_ctx.csrf_token:
+        await get_csrf_token(ctx)
+
+    async def make_request() -> httpx.Response:
+        headers = {}
+
+        # Add CSRF token for non-GET requests
+        if method.lower() != "get" and superset_ctx.csrf_token:
+            headers["X-CSRFToken"] = superset_ctx.csrf_token
+
+        if method.lower() == "get":
+            return await client.get(endpoint, params=params)
+        elif method.lower() == "post":
+            return await client.post(
+                endpoint, json=data, params=params, headers=headers
+            )
+        elif method.lower() == "put":
+            return await client.put(endpoint, json=data, headers=headers)
+        elif method.lower() == "delete":
+            return await client.delete(endpoint, headers=headers)
+        else:
+            raise ValueError(f"Unsupported HTTP method: {method}")
+
+    # Use auto_refresh if requested
+    response = (
+        await with_auto_refresh(ctx, make_request)
+        if auto_refresh
+        else await make_request()
+    )
+
+    if response.status_code not in [200, 201]:
+        return {
+            "error": f"API request failed: {response.status_code} - {response.text}"
+        }
+
+    return response.json()
+
+
+# ===== Authentication Tools =====
+
 
 @mcp.tool()
+@handle_api_errors
 async def superset_auth_check_token_validity(ctx: Context) -> Dict[str, Any]:
     """
     Check if the current access token is still valid
@@ -152,6 +349,7 @@ async def superset_auth_check_token_validity(ctx: Context) -> Dict[str, Any]:
 
 
 @mcp.tool()
+@handle_api_errors
 async def superset_auth_refresh_token(ctx: Context) -> Dict[str, Any]:
     """
     Refresh the access token using the refresh endpoint
@@ -192,6 +390,7 @@ async def superset_auth_refresh_token(ctx: Context) -> Dict[str, Any]:
 
 
 @mcp.tool()
+@handle_api_errors
 async def superset_auth_authenticate_user(
     ctx: Context,
     username: Optional[str] = None,
@@ -265,6 +464,9 @@ async def superset_auth_authenticate_user(
         superset_ctx.access_token = access_token
         superset_ctx.client.headers.update({"Authorization": f"Bearer {access_token}"})
 
+        # Get CSRF token after successful authentication
+        await get_csrf_token(ctx)
+
         return {
             "message": "Successfully authenticated with Superset",
             "access_token": access_token,
@@ -274,85 +476,20 @@ async def superset_auth_authenticate_user(
         return {"error": f"Authentication error: {str(e)}"}
 
 
-async def with_auto_refresh(ctx: Context, api_call: callable) -> httpx.Response:
-    """
-    Helper function to handle automatic token refreshing for API calls
-
-    This function will attempt to execute the provided API call. If the call
-    fails with a 401 Unauthorized error, it will try to refresh the token
-    and retry the API call once.
-
-    Args:
-        ctx: The MCP context
-        api_call: The API call function to execute (should be a callable that returns a response)
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    # First attempt
-    try:
-        response = await api_call()
-
-        # If not an auth error, return the response
-        if response.status_code != 401:
-            return response
-
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code != 401:
-            raise e
-        response = e.response
-    except Exception as e:
-        # For other errors, just raise
-        raise e
-
-    # If we got a 401, try to refresh the token
-    print("Received 401 Unauthorized. Attempting to refresh token...")
-    refresh_result = await superset_auth_refresh_token(ctx)
-
-    if refresh_result.get("error"):
-        # If refresh failed, try to re-authenticate
-        print(
-            f"Token refresh failed: {refresh_result.get('error')}. Attempting re-authentication..."
-        )
-        auth_result = await superset_auth_authenticate_user(ctx)
-
-        if auth_result.get("error"):
-            # If re-authentication failed, raise an exception
-            raise HTTPException(status_code=401, detail="Authentication failed")
-
-    # Retry the API call with the new token
-    return await api_call()
+# ===== Dashboard Tools =====
 
 
 @mcp.tool()
+@requires_auth
+@handle_api_errors
 async def superset_dashboard_list(ctx: Context) -> Dict[str, Any]:
     """Get a list of dashboards from Superset"""
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        # Use the auto-refresh helper for the API call
-        async def api_call():
-            return await superset_ctx.client.get("/api/v1/dashboard/")
-
-        response = await with_auto_refresh(ctx, api_call)
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get dashboards: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting dashboards: {str(e)}"}
+    return await make_api_request(ctx, "get", "/api/v1/dashboard/")
 
 
 @mcp.tool()
+@requires_auth
+@handle_api_errors
 async def superset_dashboard_get_by_id(
     ctx: Context, dashboard_id: int
 ) -> Dict[str, Any]:
@@ -362,48 +499,82 @@ async def superset_dashboard_get_by_id(
     Args:
         dashboard_id: ID of the dashboard to retrieve
     """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get(f"/api/v1/dashboard/{dashboard_id}")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get dashboard: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting dashboard: {str(e)}"}
+    return await make_api_request(ctx, "get", f"/api/v1/dashboard/{dashboard_id}")
 
 
 @mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_dashboard_create(
+    ctx: Context, dashboard_title: str, json_metadata: Dict[str, Any] = None
+) -> Dict[str, Any]:
+    """
+    Create a new dashboard in Superset
+
+    Args:
+        dashboard_title: Title of the dashboard
+        json_metadata: Optional JSON metadata for dashboard configuration
+    """
+    payload = {"dashboard_title": dashboard_title}
+    if json_metadata:
+        payload["json_metadata"] = json_metadata
+
+    return await make_api_request(ctx, "post", "/api/v1/dashboard/", data=payload)
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_dashboard_update(
+    ctx: Context, dashboard_id: int, data: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Update an existing dashboard
+
+    Args:
+        dashboard_id: ID of the dashboard to update
+        data: Data to update (dictionary with fields to update)
+    """
+    return await make_api_request(
+        ctx, "put", f"/api/v1/dashboard/{dashboard_id}", data=data
+    )
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_dashboard_delete(ctx: Context, dashboard_id: int) -> Dict[str, Any]:
+    """
+    Delete a dashboard
+
+    Args:
+        dashboard_id: ID of the dashboard to delete
+    """
+    response = await make_api_request(
+        ctx, "delete", f"/api/v1/dashboard/{dashboard_id}"
+    )
+
+    # For delete endpoints, we may want a custom success message
+    if not response.get("error"):
+        return {"message": f"Dashboard {dashboard_id} deleted successfully"}
+
+    return response
+
+
+# ===== Chart Tools =====
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
 async def superset_chart_list(ctx: Context) -> Dict[str, Any]:
     """Get a list of charts from Superset"""
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get("/api/v1/chart/")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get charts: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting charts: {str(e)}"}
+    return await make_api_request(ctx, "get", "/api/v1/chart/")
 
 
 @mcp.tool()
+@requires_auth
+@handle_api_errors
 async def superset_chart_get_by_id(ctx: Context, chart_id: int) -> Dict[str, Any]:
     """
     Get details for a specific chart
@@ -411,181 +582,12 @@ async def superset_chart_get_by_id(ctx: Context, chart_id: int) -> Dict[str, Any
     Args:
         chart_id: ID of the chart to retrieve
     """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get(f"/api/v1/chart/{chart_id}")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get chart: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting chart: {str(e)}"}
+    return await make_api_request(ctx, "get", f"/api/v1/chart/{chart_id}")
 
 
 @mcp.tool()
-async def superset_database_list(ctx: Context) -> Dict[str, Any]:
-    """Get a list of databases from Superset"""
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get("/api/v1/database/")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get databases: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting databases: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_dataset_list(ctx: Context) -> Dict[str, Any]:
-    """Get a list of datasets from Superset"""
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get("/api/v1/dataset/")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get datasets: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting datasets: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_sqllab_execute_query(
-    ctx: Context, database_id: int, sql: str
-) -> Dict[str, Any]:
-    """
-    Execute a SQL query in SQL Lab
-
-    Args:
-        database_id: ID of the database to query
-        sql: SQL query to execute
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        payload = {
-            "database_id": database_id,
-            "sql": sql,
-            "client_id": f"mcp-client-{hash(sql)}",
-            "schema": "",
-            "sql_editor_id": f"mcp-editor-{hash(sql)}",
-            "tab": "MCP Query",
-            "async": False,
-            "runAsync": False,
-            "select_as_cta": False,
-            "ctas_method": "TABLE",
-        }
-
-        response = await superset_ctx.client.post(
-            "/api/v1/sqllab/execute/", json=payload
-        )
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to execute SQL: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error executing SQL: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_activity_get_recent(ctx: Context) -> Dict[str, Any]:
-    """Get recent activity data for the current user"""
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get("/api/v1/log/recent_activity/")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get recent activity: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting recent activity: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_user_get_current(ctx: Context) -> Dict[str, Any]:
-    """Get information about the currently authenticated user"""
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get("/api/v1/me/")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get user info: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting user info: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_sqllab_get_saved_queries(ctx: Context) -> Dict[str, Any]:
-    """Get a list of saved queries from SQL Lab"""
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get("/api/v1/saved_query/")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get saved queries: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting saved queries: {str(e)}"}
-
-
-@mcp.tool()
+@requires_auth
+@handle_api_errors
 async def superset_chart_create(
     ctx: Context,
     slice_name: str,
@@ -604,160 +606,20 @@ async def superset_chart_create(
         viz_type: Visualization type (e.g., bar, line, etc.)
         params: Visualization parameters
     """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    payload = {
+        "slice_name": slice_name,
+        "datasource_id": datasource_id,
+        "datasource_type": datasource_type,
+        "viz_type": viz_type,
+        "params": params,
+    }
 
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        payload = {
-            "slice_name": slice_name,
-            "datasource_id": datasource_id,
-            "datasource_type": datasource_type,
-            "viz_type": viz_type,
-            "params": params,
-        }
-
-        response = await superset_ctx.client.post("/api/v1/chart/", json=payload)
-
-        if response.status_code not in [200, 201]:
-            return {
-                "error": f"Failed to create chart: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error creating chart: {str(e)}"}
+    return await make_api_request(ctx, "post", "/api/v1/chart/", data=payload)
 
 
 @mcp.tool()
-async def superset_database_get_tables(
-    ctx: Context, database_id: int
-) -> Dict[str, Any]:
-    """
-    Get tables for a specific database
-
-    Args:
-        database_id: ID of the database
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get(
-            f"/api/v1/database/{database_id}/tables/"
-        )
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get database tables: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting database tables: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_dashboard_create(
-    ctx: Context, dashboard_title: str, json_metadata: Dict[str, Any] = None
-) -> Dict[str, Any]:
-    """
-    Create a new dashboard in Superset
-
-    Args:
-        dashboard_title: Title of the dashboard
-        json_metadata: Optional JSON metadata for dashboard configuration
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        payload = {
-            "dashboard_title": dashboard_title,
-        }
-        if json_metadata:
-            payload["json_metadata"] = json_metadata
-
-        response = await superset_ctx.client.post("/api/v1/dashboard/", json=payload)
-
-        if response.status_code not in [200, 201]:
-            return {
-                "error": f"Failed to create dashboard: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error creating dashboard: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_dashboard_update(
-    ctx: Context, dashboard_id: int, data: Dict[str, Any]
-) -> Dict[str, Any]:
-    """
-    Update an existing dashboard
-
-    Args:
-        dashboard_id: ID of the dashboard to update
-        data: Data to update (dictionary with fields to update)
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.put(
-            f"/api/v1/dashboard/{dashboard_id}", json=data
-        )
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to update dashboard: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error updating dashboard: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_dashboard_delete(ctx: Context, dashboard_id: int) -> Dict[str, Any]:
-    """
-    Delete a dashboard
-
-    Args:
-        dashboard_id: ID of the dashboard to delete
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.delete(f"/api/v1/dashboard/{dashboard_id}")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to delete dashboard: {response.status_code} - {response.text}"
-            }
-
-        return {"message": f"Dashboard {dashboard_id} deleted successfully"}
-
-    except Exception as e:
-        return {"error": f"Error deleting dashboard: {str(e)}"}
-
-
-@mcp.tool()
+@requires_auth
+@handle_api_errors
 async def superset_chart_update(
     ctx: Context, chart_id: int, data: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -768,26 +630,12 @@ async def superset_chart_update(
         chart_id: ID of the chart to update
         data: Data to update (dictionary with fields to update)
     """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.put(f"/api/v1/chart/{chart_id}", json=data)
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to update chart: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error updating chart: {str(e)}"}
+    return await make_api_request(ctx, "put", f"/api/v1/chart/{chart_id}", data=data)
 
 
 @mcp.tool()
+@requires_auth
+@handle_api_errors
 async def superset_chart_delete(ctx: Context, chart_id: int) -> Dict[str, Any]:
     """
     Delete a chart
@@ -795,26 +643,264 @@ async def superset_chart_delete(ctx: Context, chart_id: int) -> Dict[str, Any]:
     Args:
         chart_id: ID of the chart to delete
     """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    response = await make_api_request(ctx, "delete", f"/api/v1/chart/{chart_id}")
 
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.delete(f"/api/v1/chart/{chart_id}")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to delete chart: {response.status_code} - {response.text}"
-            }
-
+    if not response.get("error"):
         return {"message": f"Chart {chart_id} deleted successfully"}
 
-    except Exception as e:
-        return {"error": f"Error deleting chart: {str(e)}"}
+    return response
+
+
+# ===== Database Tools =====
 
 
 @mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_database_list(ctx: Context) -> Dict[str, Any]:
+    """Get a list of databases from Superset"""
+    return await make_api_request(ctx, "get", "/api/v1/database/")
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_database_get_by_id(ctx: Context, database_id: int) -> Dict[str, Any]:
+    """
+    Get details for a specific database
+
+    Args:
+        database_id: ID of the database to retrieve
+    """
+    return await make_api_request(ctx, "get", f"/api/v1/database/{database_id}")
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_database_create(
+    ctx: Context, database_name: str, sqlalchemy_uri: str, extra: Dict[str, Any] = None
+) -> Dict[str, Any]:
+    """
+    Create a new database connection in Superset
+
+    Args:
+        database_name: Name for the database connection
+        sqlalchemy_uri: SQLAlchemy URI for the connection
+        extra: Optional extra configuration parameters
+    """
+    payload = {
+        "database_name": database_name,
+        "sqlalchemy_uri": sqlalchemy_uri,
+    }
+
+    if extra:
+        payload["extra"] = extra
+
+    return await make_api_request(ctx, "post", "/api/v1/database/", data=payload)
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_database_get_tables(
+    ctx: Context, database_id: int
+) -> Dict[str, Any]:
+    """
+    Get a list of tables for a given database
+
+    Args:
+        database_id: ID of the database
+    """
+    return await make_api_request(ctx, "get", f"/api/v1/database/{database_id}/tables/")
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_database_schemas(ctx: Context, database_id: int) -> Dict[str, Any]:
+    """
+    Get schemas for a specific database
+
+    Args:
+        database_id: ID of the database
+    """
+    return await make_api_request(
+        ctx, "get", f"/api/v1/database/{database_id}/schemas/"
+    )
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_database_test_connection(
+    ctx: Context, database_data: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Test a database connection
+
+    Args:
+        database_data: Database connection data
+    """
+    return await make_api_request(
+        ctx, "post", "/api/v1/database/test_connection", data=database_data
+    )
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_database_update(
+    ctx: Context, database_id: int, data: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Update an existing database
+
+    Args:
+        database_id: ID of the database to update
+        data: Data to update (dictionary with fields to update)
+    """
+    return await make_api_request(
+        ctx, "put", f"/api/v1/database/{database_id}", data=data
+    )
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_database_delete(ctx: Context, database_id: int) -> Dict[str, Any]:
+    """
+    Delete a database
+
+    Args:
+        database_id: ID of the database to delete
+    """
+    response = await make_api_request(ctx, "delete", f"/api/v1/database/{database_id}")
+
+    if not response.get("error"):
+        return {"message": f"Database {database_id} deleted successfully"}
+
+    return response
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_database_get_catalogs(
+    ctx: Context, database_id: int
+) -> Dict[str, Any]:
+    """
+    Get all catalogs from a database
+
+    Args:
+        database_id: ID of the database
+    """
+    return await make_api_request(
+        ctx, "get", f"/api/v1/database/{database_id}/catalogs/"
+    )
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_database_get_connection(
+    ctx: Context, database_id: int
+) -> Dict[str, Any]:
+    """
+    Get a database connection info
+
+    Args:
+        database_id: ID of the database
+    """
+    return await make_api_request(
+        ctx, "get", f"/api/v1/database/{database_id}/connection"
+    )
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_database_get_function_names(
+    ctx: Context, database_id: int
+) -> Dict[str, Any]:
+    """
+    Get function names supported by a database
+
+    Args:
+        database_id: ID of the database
+    """
+    return await make_api_request(
+        ctx, "get", f"/api/v1/database/{database_id}/function_names/"
+    )
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_database_get_related_objects(
+    ctx: Context, database_id: int
+) -> Dict[str, Any]:
+    """
+    Get charts and dashboards count associated to a database
+
+    Args:
+        database_id: ID of the database
+    """
+    return await make_api_request(
+        ctx, "get", f"/api/v1/database/{database_id}/related_objects/"
+    )
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_database_validate_sql(
+    ctx: Context, database_id: int, sql: str
+) -> Dict[str, Any]:
+    """
+    Validate arbitrary SQL
+
+    Args:
+        database_id: ID of the database
+        sql: SQL to validate
+    """
+    payload = {"sql": sql}
+    return await make_api_request(
+        ctx, "post", f"/api/v1/database/{database_id}/validate_sql/", data=payload
+    )
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_database_validate_parameters(
+    ctx: Context, parameters: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Validate database connection parameters
+
+    Args:
+        parameters: Connection parameters to validate
+    """
+    return await make_api_request(
+        ctx, "post", "/api/v1/database/validate_parameters/", data=parameters
+    )
+
+
+# ===== Dataset Tools =====
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_dataset_list(ctx: Context) -> Dict[str, Any]:
+    """Get a list of datasets from Superset"""
+    return await make_api_request(ctx, "get", "/api/v1/dataset/")
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
 async def superset_dataset_get_by_id(ctx: Context, dataset_id: int) -> Dict[str, Any]:
     """
     Get details for a specific dataset
@@ -822,26 +908,12 @@ async def superset_dataset_get_by_id(ctx: Context, dataset_id: int) -> Dict[str,
     Args:
         dataset_id: ID of the dataset to retrieve
     """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get(f"/api/v1/dataset/{dataset_id}")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get dataset: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting dataset: {str(e)}"}
+    return await make_api_request(ctx, "get", f"/api/v1/dataset/{dataset_id}")
 
 
 @mcp.tool()
+@requires_auth
+@handle_api_errors
 async def superset_dataset_create(
     ctx: Context,
     table_name: str,
@@ -858,401 +930,64 @@ async def superset_dataset_create(
         schema: Optional schema name
         owners: Optional list of owner IDs
     """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    payload = {
+        "table_name": table_name,
+        "database": database_id,
+    }
 
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
+    if schema:
+        payload["schema"] = schema
 
-    try:
-        payload = {
-            "table_name": table_name,
-            "database": database_id,
-        }
+    if owners:
+        payload["owners"] = owners
 
-        if schema:
-            payload["schema"] = schema
+    return await make_api_request(ctx, "post", "/api/v1/dataset/", data=payload)
 
-        if owners:
-            payload["owners"] = owners
 
-        response = await superset_ctx.client.post("/api/v1/dataset/", json=payload)
-
-        if response.status_code not in [200, 201]:
-            return {
-                "error": f"Failed to create dataset: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error creating dataset: {str(e)}"}
+# ===== SQL Lab Tools =====
 
 
 @mcp.tool()
-async def superset_database_get_by_id(ctx: Context, database_id: int) -> Dict[str, Any]:
-    """
-    Get details for a specific database
-
-    Args:
-        database_id: ID of the database to retrieve
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get(f"/api/v1/database/{database_id}")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get database: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting database: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_database_create(
-    ctx: Context, database_name: str, sqlalchemy_uri: str, extra: Dict[str, Any] = None
+@requires_auth
+@handle_api_errors
+async def superset_sqllab_execute_query(
+    ctx: Context, database_id: int, sql: str
 ) -> Dict[str, Any]:
     """
-    Create a new database connection in Superset
+    Execute a SQL query in SQL Lab
 
     Args:
-        database_name: Name for the database connection
-        sqlalchemy_uri: SQLAlchemy URI for the connection
-        extra: Optional extra configuration parameters
+        database_id: ID of the database to query
+        sql: SQL query to execute
     """
+    # Ensure we have a CSRF token before executing the query
     superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    if not superset_ctx.csrf_token:
+        await get_csrf_token(ctx)
 
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
+    payload = {
+        "database_id": database_id,
+        "sql": sql,
+        "schema": "",
+        "tab": "MCP Query",
+        "runAsync": False,
+        "select_as_cta": False,
+    }
 
-    try:
-        payload = {
-            "database_name": database_name,
-            "sqlalchemy_uri": sqlalchemy_uri,
-        }
-
-        if extra:
-            payload["extra"] = extra
-
-        response = await superset_ctx.client.post("/api/v1/database/", json=payload)
-
-        if response.status_code not in [200, 201]:
-            return {
-                "error": f"Failed to create database: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error creating database: {str(e)}"}
+    return await make_api_request(ctx, "post", "/api/v1/sqllab/execute/", data=payload)
 
 
 @mcp.tool()
-async def superset_query_stop(ctx: Context, client_id: str) -> Dict[str, Any]:
-    """
-    Stop a running query
-
-    Args:
-        client_id: Client ID of the query to stop
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        payload = {
-            "client_id": client_id,
-        }
-
-        response = await superset_ctx.client.post("/api/v1/query/stop", json=payload)
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to stop query: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error stopping query: {str(e)}"}
+@requires_auth
+@handle_api_errors
+async def superset_sqllab_get_saved_queries(ctx: Context) -> Dict[str, Any]:
+    """Get a list of saved queries from SQL Lab"""
+    return await make_api_request(ctx, "get", "/api/v1/saved_query/")
 
 
 @mcp.tool()
-async def superset_query_list(ctx: Context) -> Dict[str, Any]:
-    """Get a list of queries from Superset"""
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get("/api/v1/query/")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get queries: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting queries: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_query_get_by_id(ctx: Context, query_id: int) -> Dict[str, Any]:
-    """
-    Get details for a specific query
-
-    Args:
-        query_id: ID of the query to retrieve
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get(f"/api/v1/query/{query_id}")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get query: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting query: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_tag_list(ctx: Context) -> Dict[str, Any]:
-    """Get a list of tags from Superset"""
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get("/api/v1/tag/")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get tags: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting tags: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_tag_create(ctx: Context, name: str) -> Dict[str, Any]:
-    """
-    Create a new tag in Superset
-
-    Args:
-        name: Name for the tag
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        payload = {
-            "name": name,
-        }
-
-        response = await superset_ctx.client.post("/api/v1/tag/", json=payload)
-
-        if response.status_code not in [200, 201]:
-            return {
-                "error": f"Failed to create tag: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error creating tag: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_tag_get_by_id(ctx: Context, tag_id: int) -> Dict[str, Any]:
-    """
-    Get details for a specific tag
-
-    Args:
-        tag_id: ID of the tag to retrieve
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get(f"/api/v1/tag/{tag_id}")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get tag: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting tag: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_tag_objects(ctx: Context) -> Dict[str, Any]:
-    """Get objects associated with tags"""
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get("/api/v1/tag/get_objects/")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get tagged objects: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting tagged objects: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_explore_form_data_create(
-    ctx: Context, form_data: Dict[str, Any]
-) -> Dict[str, Any]:
-    """
-    Create form data for chart exploration
-
-    Args:
-        form_data: Form data for chart configuration
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.post(
-            "/api/v1/explore/form_data", json=form_data
-        )
-
-        if response.status_code not in [200, 201]:
-            return {
-                "error": f"Failed to create form data: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error creating form data: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_explore_form_data_get(ctx: Context, key: str) -> Dict[str, Any]:
-    """
-    Get form data for chart exploration
-
-    Args:
-        key: Key of the form data to retrieve
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get(f"/api/v1/explore/form_data/{key}")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get form data: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting form data: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_explore_permalink_create(
-    ctx: Context, state: Dict[str, Any]
-) -> Dict[str, Any]:
-    """
-    Create a permalink for chart exploration
-
-    Args:
-        state: State data for the permalink
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.post(
-            "/api/v1/explore/permalink", json=state
-        )
-
-        if response.status_code not in [200, 201]:
-            return {
-                "error": f"Failed to create permalink: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error creating permalink: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_explore_permalink_get(ctx: Context, key: str) -> Dict[str, Any]:
-    """
-    Get a permalink for chart exploration
-
-    Args:
-        key: Key of the permalink to retrieve
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get(f"/api/v1/explore/permalink/{key}")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get permalink: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting permalink: {str(e)}"}
-
-
-@mcp.tool()
+@requires_auth
+@handle_api_errors
 async def superset_sqllab_format_sql(ctx: Context, sql: str) -> Dict[str, Any]:
     """
     Format a SQL query
@@ -1260,32 +995,15 @@ async def superset_sqllab_format_sql(ctx: Context, sql: str) -> Dict[str, Any]:
     Args:
         sql: SQL query to format
     """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        payload = {
-            "sql": sql,
-        }
-
-        response = await superset_ctx.client.post(
-            "/api/v1/sqllab/format_sql", json=payload
-        )
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to format SQL: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error formatting SQL: {str(e)}"}
+    payload = {"sql": sql}
+    return await make_api_request(
+        ctx, "post", "/api/v1/sqllab/format_sql", data=payload
+    )
 
 
 @mcp.tool()
+@requires_auth
+@handle_api_errors
 async def superset_sqllab_get_results(ctx: Context, key: str) -> Dict[str, Any]:
     """
     Get results of a SQL query
@@ -1293,26 +1011,14 @@ async def superset_sqllab_get_results(ctx: Context, key: str) -> Dict[str, Any]:
     Args:
         key: Result key to retrieve
     """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get(f"/api/v1/sqllab/results/?key={key}")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get SQL results: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting SQL results: {str(e)}"}
+    return await make_api_request(
+        ctx, "get", f"/api/v1/sqllab/results/", params={"key": key}
+    )
 
 
 @mcp.tool()
+@requires_auth
+@handle_api_errors
 async def superset_sqllab_estimate_query_cost(
     ctx: Context, database_id: int, sql: str, schema: str = None
 ) -> Dict[str, Any]:
@@ -1324,36 +1030,20 @@ async def superset_sqllab_estimate_query_cost(
         sql: SQL query to estimate
         schema: Optional schema name
     """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    payload = {
+        "database_id": database_id,
+        "sql": sql,
+    }
 
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
+    if schema:
+        payload["schema"] = schema
 
-    try:
-        payload = {
-            "database_id": database_id,
-            "sql": sql,
-        }
-
-        if schema:
-            payload["schema"] = schema
-
-        response = await superset_ctx.client.post(
-            "/api/v1/sqllab/estimate", json=payload
-        )
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to estimate query cost: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error estimating query cost: {str(e)}"}
+    return await make_api_request(ctx, "post", "/api/v1/sqllab/estimate", data=payload)
 
 
 @mcp.tool()
+@requires_auth
+@handle_api_errors
 async def superset_sqllab_export_query_results(
     ctx: Context, client_id: str
 ) -> Dict[str, Any]:
@@ -1364,9 +1054,6 @@ async def superset_sqllab_export_query_results(
         client_id: Client ID of the query
     """
     superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
 
     try:
         response = await superset_ctx.client.get(f"/api/v1/sqllab/export/{client_id}")
@@ -1383,72 +1070,233 @@ async def superset_sqllab_export_query_results(
 
 
 @mcp.tool()
+@requires_auth
+@handle_api_errors
 async def superset_sqllab_get_bootstrap_data(ctx: Context) -> Dict[str, Any]:
     """Get the bootstrap data for SQL Lab"""
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    return await make_api_request(ctx, "get", "/api/v1/sqllab/")
 
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
 
-    try:
-        response = await superset_ctx.client.get("/api/v1/sqllab/")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get SQL Lab bootstrap data: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting SQL Lab bootstrap data: {str(e)}"}
+# ===== Saved Query Tools =====
 
 
 @mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_saved_query_get_by_id(ctx: Context, query_id: int) -> Dict[str, Any]:
+    """
+    Get details for a specific saved query
+
+    Args:
+        query_id: ID of the saved query to retrieve
+    """
+    return await make_api_request(ctx, "get", f"/api/v1/saved_query/{query_id}")
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_saved_query_create(
+    ctx: Context, query_data: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Create a new saved query
+
+    Args:
+        query_data: Saved query data including db_id, schema, sql, label, etc.
+    """
+    return await make_api_request(ctx, "post", "/api/v1/saved_query/", data=query_data)
+
+
+# ===== Query Tools =====
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_query_stop(ctx: Context, client_id: str) -> Dict[str, Any]:
+    """
+    Stop a running query
+
+    Args:
+        client_id: Client ID of the query to stop
+    """
+    payload = {"client_id": client_id}
+    return await make_api_request(ctx, "post", "/api/v1/query/stop", data=payload)
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_query_list(ctx: Context) -> Dict[str, Any]:
+    """Get a list of queries from Superset"""
+    return await make_api_request(ctx, "get", "/api/v1/query/")
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_query_get_by_id(ctx: Context, query_id: int) -> Dict[str, Any]:
+    """
+    Get details for a specific query
+
+    Args:
+        query_id: ID of the query to retrieve
+    """
+    return await make_api_request(ctx, "get", f"/api/v1/query/{query_id}")
+
+
+# ===== Activity and User Tools =====
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_activity_get_recent(ctx: Context) -> Dict[str, Any]:
+    """Get recent activity data for the current user"""
+    return await make_api_request(ctx, "get", "/api/v1/log/recent_activity/")
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_user_get_current(ctx: Context) -> Dict[str, Any]:
+    """Get information about the currently authenticated user"""
+    return await make_api_request(ctx, "get", "/api/v1/me/")
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
 async def superset_user_get_roles(ctx: Context) -> Dict[str, Any]:
     """Get roles for the current user"""
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    return await make_api_request(ctx, "get", "/api/v1/me/roles/")
 
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
 
-    try:
-        response = await superset_ctx.client.get("/api/v1/me/roles/")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get user roles: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting user roles: {str(e)}"}
+# ===== Tag Tools =====
 
 
 @mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_tag_list(ctx: Context) -> Dict[str, Any]:
+    """Get a list of tags from Superset"""
+    return await make_api_request(ctx, "get", "/api/v1/tag/")
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_tag_create(ctx: Context, name: str) -> Dict[str, Any]:
+    """
+    Create a new tag in Superset
+
+    Args:
+        name: Name for the tag
+    """
+    payload = {"name": name}
+    return await make_api_request(ctx, "post", "/api/v1/tag/", data=payload)
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_tag_get_by_id(ctx: Context, tag_id: int) -> Dict[str, Any]:
+    """
+    Get details for a specific tag
+
+    Args:
+        tag_id: ID of the tag to retrieve
+    """
+    return await make_api_request(ctx, "get", f"/api/v1/tag/{tag_id}")
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_tag_objects(ctx: Context) -> Dict[str, Any]:
+    """Get objects associated with tags"""
+    return await make_api_request(ctx, "get", "/api/v1/tag/get_objects/")
+
+
+# ===== Explore Tools =====
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_explore_form_data_create(
+    ctx: Context, form_data: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Create form data for chart exploration
+
+    Args:
+        form_data: Form data for chart configuration
+    """
+    return await make_api_request(
+        ctx, "post", "/api/v1/explore/form_data", data=form_data
+    )
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_explore_form_data_get(ctx: Context, key: str) -> Dict[str, Any]:
+    """
+    Get form data for chart exploration
+
+    Args:
+        key: Key of the form data to retrieve
+    """
+    return await make_api_request(ctx, "get", f"/api/v1/explore/form_data/{key}")
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_explore_permalink_create(
+    ctx: Context, state: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Create a permalink for chart exploration
+
+    Args:
+        state: State data for the permalink
+    """
+    return await make_api_request(ctx, "post", "/api/v1/explore/permalink", data=state)
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_explore_permalink_get(ctx: Context, key: str) -> Dict[str, Any]:
+    """
+    Get a permalink for chart exploration
+
+    Args:
+        key: Key of the permalink to retrieve
+    """
+    return await make_api_request(ctx, "get", f"/api/v1/explore/permalink/{key}")
+
+
+# ===== Menu Tools =====
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
 async def superset_menu_get(ctx: Context) -> Dict[str, Any]:
     """Get the Superset menu data"""
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    return await make_api_request(ctx, "get", "/api/v1/menu/")
 
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
 
-    try:
-        response = await superset_ctx.client.get("/api/v1/menu/")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get menu data: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting menu data: {str(e)}"}
+# ===== Advanced Data Type Tools =====
 
 
 @mcp.tool()
+@requires_auth
+@handle_api_errors
 async def superset_advanced_data_type_convert(
     ctx: Context, type_name: str, value: Any
 ) -> Dict[str, Any]:
@@ -1459,170 +1307,22 @@ async def superset_advanced_data_type_convert(
         type_name: Name of the advanced data type
         value: Value to convert
     """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    params = {
+        "type_name": type_name,
+        "value": value,
+    }
 
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        payload = {
-            "type_name": type_name,
-            "value": value,
-        }
-
-        response = await superset_ctx.client.get(
-            "/api/v1/advanced_data_type/convert", params=payload
-        )
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to convert advanced data type: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error converting advanced data type: {str(e)}"}
+    return await make_api_request(
+        ctx, "get", "/api/v1/advanced_data_type/convert", params=params
+    )
 
 
 @mcp.tool()
+@requires_auth
+@handle_api_errors
 async def superset_advanced_data_type_list(ctx: Context) -> Dict[str, Any]:
     """Get list of available advanced data types"""
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get("/api/v1/advanced_data_type/types")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get advanced data types: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting advanced data types: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_database_schemas(ctx: Context, database_id: int) -> Dict[str, Any]:
-    """
-    Get schemas for a specific database
-
-    Args:
-        database_id: ID of the database
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get(
-            f"/api/v1/database/{database_id}/schemas/"
-        )
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get database schemas: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting database schemas: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_database_test_connection(
-    ctx: Context, database_data: Dict[str, Any]
-) -> Dict[str, Any]:
-    """
-    Test a database connection
-
-    Args:
-        database_data: Database connection data
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.post(
-            "/api/v1/database/test_connection", json=database_data
-        )
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to test connection: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error testing connection: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_saved_query_get_by_id(ctx: Context, query_id: int) -> Dict[str, Any]:
-    """
-    Get details for a specific saved query
-
-    Args:
-        query_id: ID of the saved query to retrieve
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.get(f"/api/v1/saved_query/{query_id}")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get saved query: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error getting saved query: {str(e)}"}
-
-
-@mcp.tool()
-async def superset_saved_query_create(
-    ctx: Context, query_data: Dict[str, Any]
-) -> Dict[str, Any]:
-    """
-    Create a new saved query
-
-    Args:
-        query_data: Saved query data including db_id, schema, sql, label, etc.
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "Not authenticated. Please authenticate first."}
-
-    try:
-        response = await superset_ctx.client.post(
-            "/api/v1/saved_query/", json=query_data
-        )
-
-        if response.status_code not in [200, 201]:
-            return {
-                "error": f"Failed to create saved query: {response.status_code} - {response.text}"
-            }
-
-        return response.json()
-
-    except Exception as e:
-        return {"error": f"Error creating saved query: {str(e)}"}
+    return await make_api_request(ctx, "get", "/api/v1/advanced_data_type/types")
 
 
 if __name__ == "__main__":
