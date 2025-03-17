@@ -70,6 +70,12 @@ After setup, you can interact with your Superset instance via Claude using natur
 - **Get database tables**: "What tables are available in database with ID 1?"
 - **Execute SQL**: "Run this SQL query on database 1: SELECT * FROM users LIMIT 10"
 - **Create dataset**: "Create a new dataset from table 'customers' in database 2"
+- **Update database**: "Update the connection settings for database 3"
+- **Delete database**: "Delete database connection with ID 4"
+- **Validate SQL**: "Is this SQL valid for database 2: SELECT * FROM customers JOIN orders"
+- **Get database catalogs**: "Show me the catalogs available in database 1"
+- **Get database functions**: "What functions are available in database 2?"
+- **Check related objects**: "What dashboards and charts use database 1?"
 
 ### SQL Lab Features
 
@@ -85,6 +91,15 @@ After setup, you can interact with your Superset instance via Claude using natur
 - **Get user roles**: "What roles do I have in Superset?"
 - **View recent activity**: "Show me recent activity in my Superset instance"
 - **Get menu data**: "What menu items do I have access to?"
+- **Get base URL**: "What is the URL of the Superset instance I'm connected to?"
+
+### Tag Management
+
+- **List tags**: "Show me all tags in my Superset instance"
+- **Create tag**: "Create a new tag called 'Finance'"
+- **Delete tag**: "Delete the tag with ID 5"
+- **Tag an object**: "Add the tag 'Finance' to dashboard 3"
+- **Remove tag**: "Remove the tag 'Finance' from chart 7"
 
 ## Available MCP Tools
 
@@ -116,6 +131,14 @@ This plugin offers the following MCP tools that Claude can use:
 - `superset_database_get_tables` - List tables in a database
 - `superset_database_schemas` - Get schemas for a database
 - `superset_database_test_connection` - Test a database connection
+- `superset_database_update` - Update an existing database connection
+- `superset_database_delete` - Delete a database connection
+- `superset_database_get_catalogs` - Get catalogs for a database
+- `superset_database_get_connection` - Get database connection information
+- `superset_database_get_function_names` - Get function names supported by a database
+- `superset_database_get_related_objects` - Get charts and dashboards associated with a database
+- `superset_database_validate_sql` - Validate arbitrary SQL against a database
+- `superset_database_validate_parameters` - Validate database connection parameters
 
 ### Datasets
 - `superset_dataset_list` - List all datasets
@@ -149,16 +172,24 @@ This plugin offers the following MCP tools that Claude can use:
 
 ### System
 - `superset_menu_get` - Get menu data
+- `superset_config_get_base_url` - Get the base URL of the Superset instance
 
-### Advanced Features
+### Tags
 - `superset_tag_list` - List all tags
 - `superset_tag_create` - Create a new tag
 - `superset_tag_get_by_id` - Get a specific tag
 - `superset_tag_objects` - Get objects associated with tags
+- `superset_tag_delete` - Delete a tag
+- `superset_tag_object_add` - Add a tag to an object
+- `superset_tag_object_remove` - Remove a tag from an object
+
+### Exploration Tools
 - `superset_explore_form_data_create` - Create form data for chart exploration
 - `superset_explore_form_data_get` - Get form data for chart exploration
 - `superset_explore_permalink_create` - Create a permalink for chart exploration
 - `superset_explore_permalink_get` - Get a permalink for chart exploration
+
+### Advanced Data Types
 - `superset_advanced_data_type_convert` - Convert a value to an advanced data type
 - `superset_advanced_data_type_list` - List available advanced data types
 
