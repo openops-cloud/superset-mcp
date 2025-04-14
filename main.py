@@ -676,7 +676,7 @@ async def superset_chart_create(
         "datasource_id": datasource_id,
         "datasource_type": datasource_type,
         "viz_type": viz_type,
-        "params": params,
+        "params": json.dumps(params),
     }
 
     return await make_api_request(ctx, "post", "/api/v1/chart/", data=payload)
