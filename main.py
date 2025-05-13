@@ -899,6 +899,7 @@ async def superset_database_test_connection(
 
 
 @mcp.tool()
+@forbidden
 @requires_auth
 @handle_api_errors
 async def superset_database_update(
@@ -1366,6 +1367,7 @@ async def superset_saved_query_get_by_id(ctx: Context, query_id: int) -> Dict[st
 
 
 @mcp.tool()
+@forbidden
 @requires_auth
 @handle_api_errors
 async def superset_saved_query_create(
@@ -1631,6 +1633,7 @@ async def superset_tag_object_add(
 
 
 @mcp.tool()
+@forbidden
 @requires_auth
 @handle_api_errors
 async def superset_tag_object_remove(
