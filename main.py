@@ -158,6 +158,16 @@ def requires_auth(
 
     return wrapper
 
+def forbidden(
+    func: Callable[..., Awaitable[Dict[str, Any]]],
+) -> Callable[..., Awaitable[Dict[str, Any]]]:
+    """Decorator to forbid dangerous operations"""
+
+    @wraps(func)
+    async def wrapper(ctx: Context, *args, **kwargs) -> Dict[str, Any]:
+        return {"error": "This operation is forbidden."}
+
+    return wrapper
 
 def handle_api_errors(
     func: Callable[..., Awaitable[Dict[str, Any]]],
@@ -581,6 +591,7 @@ async def superset_dashboard_update(
 
 
 @mcp.tool()
+@forbidden
 @requires_auth
 @handle_api_errors
 async def superset_dashboard_delete(ctx: Context, dashboard_id: int) -> Dict[str, Any]:
@@ -705,6 +716,7 @@ async def superset_chart_update(
 
 
 @mcp.tool()
+@forbidden
 @requires_auth
 @handle_api_errors
 async def superset_chart_delete(ctx: Context, chart_id: int) -> Dict[str, Any]:
@@ -911,6 +923,7 @@ async def superset_database_update(
 
 
 @mcp.tool()
+@forbidden
 @requires_auth
 @handle_api_errors
 async def superset_database_delete(ctx: Context, database_id: int) -> Dict[str, Any]:
@@ -1562,6 +1575,7 @@ async def superset_tag_objects(ctx: Context) -> Dict[str, Any]:
 
 
 @mcp.tool()
+@forbidden
 @requires_auth
 @handle_api_errors
 async def superset_tag_delete(ctx: Context, tag_id: int) -> Dict[str, Any]:
