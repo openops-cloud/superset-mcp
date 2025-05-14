@@ -7,16 +7,12 @@ from typing import (
     Callable,
     TypeVar,
     Awaitable,
-    Union,
 )
 import os
 import httpx
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import wraps
-import inspect
-from threading import Thread
-import webbrowser
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -152,7 +148,7 @@ def requires_auth(
         superset_ctx: SupersetContext = ctx.request_context.lifespan_context
 
         if not superset_ctx.access_token:
-            return {"error": "Not authenticated. Please authenticate first."}
+            await superset_auth_authenticate_user(ctx)
 
         return await func(ctx, *args, **kwargs)
 
@@ -320,7 +316,6 @@ async def make_api_request(
 # ===== Authentication Tools =====
 
 
-@mcp.tool()
 @handle_api_errors
 async def superset_auth_check_token_validity(ctx: Context) -> Dict[str, Any]:
     """
@@ -353,7 +348,6 @@ async def superset_auth_check_token_validity(ctx: Context) -> Dict[str, Any]:
         return {"valid": False, "error": str(e)}
 
 
-@mcp.tool()
 @handle_api_errors
 async def superset_auth_refresh_token(ctx: Context) -> Dict[str, Any]:
     """
@@ -398,7 +392,6 @@ async def superset_auth_refresh_token(ctx: Context) -> Dict[str, Any]:
         return {"error": f"Error refreshing token: {str(e)}"}
 
 
-@mcp.tool()
 @handle_api_errors
 async def superset_auth_authenticate_user(
     ctx: Context,
