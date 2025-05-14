@@ -504,22 +504,23 @@ async def superset_dashboard_list(ctx: Context) -> Dict[str, Any]:
 @mcp.tool()
 @requires_auth
 @handle_api_errors
-async def superset_dashboard_get_by_id(
-    ctx: Context, dashboard_id: int
+async def superset_dashboard_get_by_id_or_slug(
+    ctx: Context, dashboard_id_or_slug: str
 ) -> Dict[str, Any]:
     """
-    Get details for a specific dashboard
-
-    Makes a request to the /api/v1/dashboard/{id} endpoint to retrieve detailed
-    information about a specific dashboard.
-
+    Retrieve detailed information for a specific dashboard.
+    
+    Makes a request to the /api/v1/dashboard/{dashboard_id_or_slug} endpoint to fetch comprehensive
+    information about a dashboard, including its metadata, components, and layout.
+    
     Args:
-        dashboard_id: ID of the dashboard to retrieve
-
+        dashboard_id_or_slug(str): The unique ID or the name (slug) of the dashboard.
+    
     Returns:
-        A dictionary with complete dashboard information including components and layout
+        dict: A dictionary containing complete dashboard details such as title, components,
+              layout configuration, and associated metadata.
     """
-    return await make_api_request(ctx, "get", f"/api/v1/dashboard/{dashboard_id}")
+    return await make_api_request(ctx, "get", f"/api/v1/dashboard/{dashboard_id_or_slug}")
 
 
 @mcp.tool()
@@ -1969,3 +1970,30 @@ async def superset_advanced_data_type_list(ctx: Context) -> Dict[str, Any]:
 if __name__ == "__main__":
     print("Starting Superset MCP server...")
     mcp.run()
+
+
+with open("superset.spec.json", "r") as f:
+    full_spec = json.load(f)
+
+# Filter out only DELETE endpoints from the OpenAPI spec
+def filter_delete_endpoints(spec):
+    paths = spec.get("paths", {})
+    filtered_paths = {
+        path: methods
+        for path, methods in paths.items()
+        if any(method.lower() == "delete" for method in methods)
+    }
+    filtered_spec = dict(spec)
+    filtered_spec["paths"] = filtered_paths
+    return filtered_spec
+
+filtered_spec = filter_delete_endpoints(full_spec)
+
+# Configure the HTTPX AsyncClient with authentication (e.g., Bearer Token)
+api_client = httpx.AsyncClient(
+    base_url="https://api.example.com",
+    headers={"Authorization": "Bearer YOUR_TOKEN_HERE"}
+)
+
+# Create the MCP server using the filtered spec and the authenticated client
+mcp = FastMCP.from_openapi(openapi_spec=filtered_spec, client=api_client)
