@@ -648,19 +648,142 @@ async def superset_chart_create(
     params: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    Create a new chart in Superset
+    Create a new chart in Apache Superset.
 
-    Makes a request to the /api/v1/chart/ POST endpoint to create a new visualization.
+    Sends a POST request to the `/api/v1/chart/` endpoint to create a new visualization
+    based on an existing dataset or SQL-based virtual dataset.
+
+    Important:
+        **Do not rely on user-input column names**. All column references (e.g., in `groupby`, `columns`, `entity`, etc.)
+          **must exactly match the column names from the dataset schema**, including casing.
+        For example, if the dataset contains `"Tags"`, using `"tags"` will result in an error or empty chart.
+        The structure of `params` and required fields varies based on `viz_type`.
+        The structure of `metric` and `metrics` differs:
+            Use `metric` (a single object) for charts like `big_number`, `pie`, `gauge`.
+            Use `metrics` (a list of objects) for charts like `bar`, `line`, `table`, etc.
+
+    Metric Object Format:
+        A metric can be expressed using the following structure:
+
+        {
+          "expressionType": "SIMPLE" | "SQL",
+          "aggregate": "<aggregation_function>",     // Only for SIMPLE
+          "column": {
+            "column_name": "<ExactColumnName>",      // Case-sensitive
+            "type": "<column_type>"
+          },
+          "sqlExpression": "<custom_sql>"            // Only for SQL expression type
+        }
+
+    Example:
+        create_chart(
+            slice_name="Total Sales (Big Number)",
+            datasource_id=7,
+            datasource_type="table",
+            viz_type="big_number",
+            params={
+                "metric": {
+                  "expressionType": "SQL",
+                  "sqlExpression": "COUNT(*)"
+                },
+                "time_range": "Last 30 days",
+                "compare_lag": "1",
+                "compare_suffix": "previous"
+            }
+        )
 
     Args:
-        slice_name: Name/title of the chart
-        datasource_id: ID of the dataset or SQL table
-        datasource_type: Type of datasource ('table' for datasets, 'query' for SQL)
-        viz_type: Visualization type (e.g., 'bar', 'line', 'pie', 'big_number', etc.)
-        params: Visualization parameters including metrics, groupby, time_range, etc.
+        slice_name (str): Title of the chart (used in dashboards and chart listings).
+        datasource_id (int): ID of the dataset (physical or virtual).
+        datasource_type (str): One of 'table' or 'query'.
+        dashboards list[dict]: Dashboards where the chart will be included
+        viz_type (str): Visualization type. Common values include:
+            'bar', 'line', 'pie', 'table', 'big_number', 'pivot_table_v2', 'treemap_v2', etc.
+        params (dict): Visualization-specific settings. All column references must use
+            exact names from the dataset schema the values are case-sensitive.
+
+            Common parameters (depend on viz_type):
+                - metric (dict): For single-metric charts like `big_number`, `pie`, `gauge`.
+                - metrics (list[dict]): For multi-metric charts like `bar`, `line`, `table`.
+                - groupby (list[str]): Columns to group by. **Case-sensitive**.
+                - columns (list[str]): Columns to pivot/group for tabular charts.
+                - time_range (str): Time range (e.g., "Last 30 days").
+                - adhoc_filters (list[dict]): Optional filter clauses.
+                - row_limit (int): Max rows to return.
+                - order_desc (bool): Sort descending on main metric.
+                - color_scheme (str): Optional visual color scheme.
+                - x_axis, y_axis, entity, all_columns_x, etc.: Required depending on chart type.
+
+    Chart Type Specific Parameters
+    ------------------------------
+
+    Line Chart (Time Series)
+        - viz_type: 'line'
+        - Required: metrics, x_axis
+
+    Line Chart V2
+        - viz_type: 'echarts_timeseries_line'
+        - Required: metrics, x_axis
+
+    Bar Chart (Time Series)
+        - viz_type: 'bar'
+        - Required: metrics, x_axis
+
+    Bar Chart V2
+        - viz_type: 'echarts_timeseries_bar'
+        - Required: metrics, x_axis
+
+    Pie Chart
+        - viz_type: 'pie'
+        - Required: metric, groupby
+
+    Bubble Chart
+        - viz_type: 'bubble'
+        - Required: entity, x, y, size
+
+    Sankey Diagram
+        - viz_type: 'sankey'
+        - Required: groupby (exactly 2 columns), metric
+
+    Heatmap
+        - viz_type: 'heatmap'
+        - Required: all_columns_x, all_columns_y, metric
+
+    Box Plot
+        - viz_type: 'box_plot'
+        - Required: metrics, groupby
+
+    Treemap
+        - viz_type: 'treemap_v2'
+        - Required: metrics, groupby
+
+    World Map
+        - viz_type: 'world_map'
+        - Required: country_fieldtype, entity, metric
+
+    Pivot Table
+        - viz_type: 'pivot_table_v2'
+        - Required: metrics, groupby
+
+    Table
+        - viz_type: 'table'
+        - Required: all_columns OR metrics
+
+    Histogram
+        - viz_type: 'histogram'
+        - Required: all_columns_x
+
+    Big Number
+        - viz_type: 'big_number'
+        - Required: metric
 
     Returns:
-        A dictionary with the created chart information including its ID
+        dict: Metadata of the created chart, including:
+            - id (int): Chart ID
+            - slice_name (str): Chart title
+            - datasource_id (int)
+            - viz_type (str)
+            - params (dict): Resolved chart configuration
     """
     payload = {
         "slice_name": slice_name,
@@ -688,6 +811,36 @@ async def superset_chart_update(
     Args:
         chart_id: ID of the chart to update
         data: Data to update, can include slice_name, description, viz_type, params, etc.
+
+    Example:
+        data: {
+          "cache_timeout": 0,
+          "certification_details": "string",
+          "certified_by": "string",
+          "dashboards": [
+            0
+          ],
+          "datasource_id": 0,
+          "datasource_type": "table",
+          "description": "string",
+          "external_url": "string",
+          "is_managed_externally": true,
+          "owners": [
+            0
+          ],
+          "params": "string",
+          "query_context": "string",
+          "query_context_generation": true,
+          "slice_name": "string",
+          "tags": [
+            0
+          ],
+          "viz_type": [
+            "bar",
+            "area",
+            "table"
+          ]
+        }
 
     Returns:
         A dictionary with the updated chart information
