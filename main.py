@@ -158,17 +158,6 @@ def requires_auth(
 
     return wrapper
 
-def forbidden(
-    func: Callable[..., Awaitable[Dict[str, Any]]],
-) -> Callable[..., Awaitable[Dict[str, Any]]]:
-    """Decorator to forbid dangerous operations"""
-
-    @wraps(func)
-    async def wrapper(ctx: Context, *args, **kwargs) -> Dict[str, Any]:
-        return {"error": "This operation is forbidden."}
-
-    return wrapper
-
 def handle_api_errors(
     func: Callable[..., Awaitable[Dict[str, Any]]],
 ) -> Callable[..., Awaitable[Dict[str, Any]]]:
@@ -590,8 +579,6 @@ async def superset_dashboard_update(
     )
 
 
-@mcp.tool()
-@forbidden
 @requires_auth
 @handle_api_errors
 async def superset_dashboard_delete(ctx: Context, dashboard_id: int) -> Dict[str, Any]:
@@ -715,8 +702,6 @@ async def superset_chart_update(
     return await make_api_request(ctx, "put", f"/api/v1/chart/{chart_id}", data=data)
 
 
-@mcp.tool()
-@forbidden
 @requires_auth
 @handle_api_errors
 async def superset_chart_delete(ctx: Context, chart_id: int) -> Dict[str, Any]:
@@ -898,8 +883,6 @@ async def superset_database_test_connection(
     )
 
 
-@mcp.tool()
-@forbidden
 @requires_auth
 @handle_api_errors
 async def superset_database_update(
@@ -923,8 +906,6 @@ async def superset_database_update(
     )
 
 
-@mcp.tool()
-@forbidden
 @requires_auth
 @handle_api_errors
 async def superset_database_delete(ctx: Context, database_id: int) -> Dict[str, Any]:
@@ -1366,8 +1347,6 @@ async def superset_saved_query_get_by_id(ctx: Context, query_id: int) -> Dict[st
     return await make_api_request(ctx, "get", f"/api/v1/saved_query/{query_id}")
 
 
-@mcp.tool()
-@forbidden
 @requires_auth
 @handle_api_errors
 async def superset_saved_query_create(
@@ -1576,8 +1555,6 @@ async def superset_tag_objects(ctx: Context) -> Dict[str, Any]:
     return await make_api_request(ctx, "get", "/api/v1/tag/get_objects/")
 
 
-@mcp.tool()
-@forbidden
 @requires_auth
 @handle_api_errors
 async def superset_tag_delete(ctx: Context, tag_id: int) -> Dict[str, Any]:
@@ -1632,8 +1609,6 @@ async def superset_tag_object_add(
     )
 
 
-@mcp.tool()
-@forbidden
 @requires_auth
 @handle_api_errors
 async def superset_tag_object_remove(
@@ -1847,4 +1822,4 @@ async def superset_advanced_data_type_list(ctx: Context) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     print("Starting Superset MCP server...")
-    mcp.run()
+    mcp.run(transport="sse")
