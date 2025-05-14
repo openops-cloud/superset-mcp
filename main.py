@@ -1822,4 +1822,4 @@ async def superset_advanced_data_type_list(ctx: Context) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     print("Starting Superset MCP server...")
-    mcp.run(transport="sse")
+    mcp.run()
