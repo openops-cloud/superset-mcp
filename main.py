@@ -1970,30 +1970,3 @@ async def superset_advanced_data_type_list(ctx: Context) -> Dict[str, Any]:
 if __name__ == "__main__":
     print("Starting Superset MCP server...")
     mcp.run()
-
-
-with open("superset.spec.json", "r") as f:
-    full_spec = json.load(f)
-
-# Filter out only DELETE endpoints from the OpenAPI spec
-def filter_delete_endpoints(spec):
-    paths = spec.get("paths", {})
-    filtered_paths = {
-        path: methods
-        for path, methods in paths.items()
-        if any(method.lower() == "delete" for method in methods)
-    }
-    filtered_spec = dict(spec)
-    filtered_spec["paths"] = filtered_paths
-    return filtered_spec
-
-filtered_spec = filter_delete_endpoints(full_spec)
-
-# Configure the HTTPX AsyncClient with authentication (e.g., Bearer Token)
-api_client = httpx.AsyncClient(
-    base_url="https://api.example.com",
-    headers={"Authorization": "Bearer YOUR_TOKEN_HERE"}
-)
-
-# Create the MCP server using the filtered spec and the authenticated client
-mcp = FastMCP.from_openapi(openapi_spec=filtered_spec, client=api_client)
