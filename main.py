@@ -697,7 +697,7 @@ async def superset_chart_create(
         slice_name (str): Title of the chart (used in dashboards and chart listings).
         datasource_id (int): ID of the dataset (physical or virtual).
         datasource_type (str): One of 'table' or 'query'.
-        dashboards list[dict]: Dashboards where the chart will be included
+        dashboards list[dict]: List of dashboards where this chart is presented
         viz_type (str): Visualization type. Common values include:
             'bar', 'line', 'pie', 'table', 'big_number', 'pivot_table_v2', 'treemap_v2', etc.
         params (dict): Visualization-specific settings. All column references must use
@@ -812,13 +812,21 @@ async def superset_chart_update(
     Args:
         chart_id: ID of the chart to update
         data: Data to update, can include slice_name, description, viz_type, params, etc.
-
+            Common data parameters (depend on viz_type):
+                - slice_name (str): Title of the chart (used in dashboards and chart listings).
+                - datasource_id (int): ID of the dataset (physical or virtual).
+                - datasource_type (str): One of 'table' or 'query'.
+                - dashboards list[dict]: List of dashboards where this chart is presented
+                - viz_type (str): Visualization type. Common values include:
+                    'bar', 'line', 'pie', 'table', 'big_number', 'pivot_table_v2', 'treemap_v2', etc.
+                - params (dict): Visualization-specific settings. All column references must use
+                    exact names from the dataset schema the values are case-sensitive.
     Example:
         data: {
           "cache_timeout": 0,
           "certification_details": "string",
           "certified_by": "string",
-          "dashboards": [
+          "dashboards": [ // List of dashboards id hwere this chart is presented
             0
           ],
           "datasource_id": 0,
